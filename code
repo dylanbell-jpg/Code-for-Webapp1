@@ -1,0 +1,1872 @@
+/***************************************************************
+ * ICI QUOTE SYSTEM
+ * Google Apps Script
+ ***************************************************************/
+
+const CONFIG = {
+  MASTER_SPREADSHEET_ID: '1q15rg9hUjoCSM6BHdqVVrzghrzd4tM7IM6CibMoNs9o',
+  QUOTE_SHEET: 'Quote',
+  CUSTOMER_QUOTE_SHEET: 'Customer Quote',
+  SALES_ARCHIVE: 'Sales Quotes',
+  SERVICE_ARCHIVE: 'Service Quotes',
+  CUSTOMER_DB: 'Customer Database',
+  LISTS_SHEET: 'Lists',
+
+  QUOTE_TYPE_CELL: 'C4',
+  QUOTE_NUMBER_CELL: 'E4',
+  DATE_CELL: 'E5',
+  PREPARED_BY_CELL: 'E7',
+
+  CUSTOMER_CELL: 'B9',
+  ATTENTION_CELL: 'B10',
+  PHONE_CELL: 'B11',
+  EMAIL_CELL: 'B12',
+
+  ITEM_START_ROW: 15,
+  ITEM_END_ROW: 33,
+
+  TOTAL_CELL: 'J30'
+};
+
+
+/***************************************************************
+ * CUSTOM MENU
+ ***************************************************************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Quote Tools')
+    .addItem('Save Quote', 'saveQuote')
+    .addItem('Generate Quote Number', 'generateQuoteNumber')
+    .addItem('Clear Quote', 'clearQuote')
+    .addToUi();
+}
+
+
+/***************************************************************
+ * AUTO ACTIONS
+ ***************************************************************/
+function onEdit(e) {
+  if (!e) return;
+
+  const sheet = e.range.getSheet();
+  const sheetName = sheet.getName();
+  const a1 = e.range.getA1Notation();
+
+  // CREATE REVISION
+  if (
+    sheetName === 'Archive Search' &&
+    a1 === 'J2' &&
+    e.value === 'TRUE'
+  ) {
+    try {
+      createRevisionFromArchiveSearch();
+    } catch (err) {
+      SpreadsheetApp.getUi().alert(
+        'Could not create revision:\n\n' +
+        err.message
+      );
+    } finally {
+      sheet.getRange('J2').setValue(false);
+    }
+
+    return;
+  }
+
+  if (sheetName !== CONFIG.QUOTE_SHEET) return;
+
+  // CUSTOMER SELECTED
+  if (a1 === CONFIG.CUSTOMER_CELL) {
+    autoFillCustomer(sheet);
+    return;
+  }
+
+  // ATTENTION / CONTACT SELECTED
+  if (a1 === CONFIG.ATTENTION_CELL) {
+    autoFillCustomerContact(sheet);
+    return;
+  }
+
+  // ITEM OR PART NUMBER EDITED
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+
+  if (
+    row >= CONFIG.ITEM_START_ROW &&
+    row <= CONFIG.ITEM_END_ROW &&
+    (col === 2 || col === 3)
+  ) {
+    autoFillItemRow(sheet, row, col);
+  }
+}
+
+/***************************************************************
+ * QUOTE NUMBER
+ *
+ * Format:
+ * YYYYMMDD + sequence
+ *
+ * Example:
+ * 202610011
+ * 202610012
+ *
+ * Revisions:
+ * 202610011-2
+ * 202610011-3
+ ***************************************************************/
+function generateQuoteNumber() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const quoteSheet = ss.getSheetByName(CONFIG.QUOTE_SHEET);
+
+  const current = String(
+    quoteSheet.getRange(CONFIG.QUOTE_NUMBER_CELL).getDisplayValue()
+  ).trim();
+
+  if (current) return current;
+
+  const preparedBy = String(
+    quoteSheet.getRange(CONFIG.PREPARED_BY_CELL).getDisplayValue()
+  ).trim();
+
+  if (!preparedBy) {
+    throw new Error('Prepared By is blank.');
+  }
+
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const lists = masterSS.getSheetByName(CONFIG.LISTS_SHEET);
+
+  if (!lists) {
+    throw new Error('Lists sheet was not found.');
+  }
+
+  const lastRow = lists.getLastRow();
+
+  const salespeople = lists
+    .getRange(2, 3, lastRow - 1, 2)
+    .getDisplayValues();
+
+  let salespersonSlot = '';
+
+  for (let i = 0; i < salespeople.length; i++) {
+    const name = String(salespeople[i][0]).trim();
+    const slot = String(salespeople[i][1]).trim();
+
+    if (
+      name.toLowerCase() === preparedBy.toLowerCase()
+    ) {
+      salespersonSlot = slot;
+      break;
+    }
+  }
+
+  if (!salespersonSlot) {
+    throw new Error(
+      'No Salesperson Slot was found for ' + preparedBy + '.'
+    );
+  }
+
+  const tz = ss.getSpreadsheetTimeZone();
+  const year = Utilities.formatDate(new Date(), tz, 'yy');
+
+  const prefix = salespersonSlot + '-' + year + '-';
+
+  let highestSequence = 0;
+
+  [CONFIG.SALES_ARCHIVE, CONFIG.SERVICE_ARCHIVE].forEach(
+    function(sheetName) {
+      const archive = ss.getSheetByName(sheetName);
+
+      if (!archive || archive.getLastRow() < 2) return;
+
+      const values = archive
+        .getRange(2, 2, archive.getLastRow() - 1, 1)
+        .getDisplayValues();
+
+      values.forEach(function(row) {
+        const quoteNum = String(row[0]).trim();
+
+        if (!quoteNum) return;
+        if (quoteNum.indexOf(prefix) !== 0) return;
+
+        const parts = quoteNum.split('-');
+
+        if (parts.length < 3) return;
+
+        const sequence = parseInt(parts[2], 10);
+
+        if (!isNaN(sequence) && sequence > highestSequence) {
+          highestSequence = sequence;
+        }
+      });
+    }
+  );
+
+  const nextSequence = String(highestSequence + 1)
+    .padStart(4, '0');
+
+  const quoteNumber =
+    salespersonSlot +
+    '-' +
+    year +
+    '-' +
+    nextSequence;
+
+  quoteSheet
+    .getRange(CONFIG.QUOTE_NUMBER_CELL)
+    .setValue(quoteNumber);
+
+  if (!quoteSheet.getRange(CONFIG.DATE_CELL).getValue()) {
+    quoteSheet
+      .getRange(CONFIG.DATE_CELL)
+      .setValue(new Date());
+  }
+
+  SpreadsheetApp.flush();
+
+  return quoteNumber;
+}
+/***************************************************************
+ * SAVE QUOTE
+ ***************************************************************/
+function saveQuote() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  const quoteSheet = ss.getSheetByName(CONFIG.QUOTE_SHEET);
+  const customerQuoteSheet = ss.getSheetByName(
+    CONFIG.CUSTOMER_QUOTE_SHEET
+  );
+
+  if (!quoteSheet || !customerQuoteSheet) {
+    ui.alert('Quote sheet or Customer Quote sheet is missing.');
+    return;
+  }
+
+  let quoteNumber = String(
+    quoteSheet.getRange(CONFIG.QUOTE_NUMBER_CELL).getDisplayValue()
+  ).trim();
+
+  const quoteType = String(
+    quoteSheet.getRange(CONFIG.QUOTE_TYPE_CELL).getDisplayValue()
+  ).trim();
+
+  const preparedBy = String(
+    quoteSheet.getRange(CONFIG.PREPARED_BY_CELL).getDisplayValue()
+  ).trim();
+
+  const customer = String(
+    quoteSheet.getRange(CONFIG.CUSTOMER_CELL).getDisplayValue()
+  ).trim();
+
+  const attention = String(
+    quoteSheet.getRange(CONFIG.ATTENTION_CELL).getDisplayValue()
+  ).trim();
+
+  const phone = String(
+    quoteSheet.getRange(CONFIG.PHONE_CELL).getDisplayValue()
+  ).trim();
+
+  const email = String(
+    quoteSheet.getRange(CONFIG.EMAIL_CELL).getDisplayValue()
+  ).trim();
+
+  if (!quoteType) {
+    ui.alert('Select Sales Quote or Service Quote in C4.');
+    return;
+  }
+
+  if (!preparedBy) {
+    ui.alert('Select Prepared By before saving.');
+    return;
+  }
+
+  if (!customer) {
+    ui.alert('Enter a customer before saving.');
+    return;
+  }
+
+  if (!quoteNumber) {
+    quoteNumber = generateQuoteNumber();
+  }
+
+ let quoteDate = quoteSheet.getRange(CONFIG.DATE_CELL).getValue();
+
+if (!quoteDate) {
+  quoteDate = new Date();
+  quoteSheet.getRange(CONFIG.DATE_CELL).setValue(quoteDate);
+}
+
+try {
+  saveQuoteItemsToDatabase(quoteSheet);
+} catch (err) {
+  ui.alert(err.message);
+  return;
+}
+
+saveCustomerToDatabase(
+  customer,
+  attention,
+  phone,
+  email
+);
+
+// Pick archive
+let archiveName;
+   
+ 
+
+  if (quoteType.toLowerCase().indexOf('service') !== -1) {
+    archiveName = CONFIG.SERVICE_ARCHIVE;
+  } else {
+    archiveName = CONFIG.SALES_ARCHIVE;
+  }
+
+  const archive = ss.getSheetByName(archiveName);
+
+  if (!archive) {
+    ui.alert('Archive sheet "' + archiveName + '" was not found.');
+    return;
+  }
+
+  // Determine revision
+  const baseQuoteNumber = getBaseQuoteNumber(quoteNumber);
+  const revision = getNextRevisionNumber(baseQuoteNumber);
+
+  let finalQuoteNumber;
+
+  if (revision === 1) {
+    finalQuoteNumber = baseQuoteNumber;
+  } else {
+    finalQuoteNumber = baseQuoteNumber + '-' + revision;
+  }
+
+  quoteSheet
+    .getRange(CONFIG.QUOTE_NUMBER_CELL)
+    .setValue(finalQuoteNumber);
+
+  SpreadsheetApp.flush();
+
+  // Find salesperson quote folder
+  const folderId = getSalespersonQuoteFolder(preparedBy);
+  
+  if (!folderId) {
+    ui.alert(
+      'No Quotes Folder ID was found in Lists for ' +
+      preparedBy +
+      '.'
+    );
+    return;
+  }
+
+  // Create customer quote PDF
+  let pdfFile;
+
+  try {
+    pdfFile = createCustomerQuotePDF(
+      customerQuoteSheet,
+      folderId,
+      customer,
+      finalQuoteNumber
+    );
+  } catch (err) {
+    ui.alert('PDF creation failed: ' + err.message);
+    return;
+  }
+
+  // Total
+  let total = quoteSheet.getRange(CONFIG.TOTAL_CELL).getValue();
+
+  if (total === '' || total === null) {
+    total = 0;
+  }
+
+  // Archive row
+  const nextRow = archive.getLastRow() + 1;
+
+  archive.getRange(nextRow, 1, 1, 9).setValues([[
+    customer,
+    finalQuoteNumber,
+    quoteDate,
+    preparedBy,
+    quoteType,
+    total,
+    revision,
+    pdfFile.getUrl(),
+    new Date()
+  ]]);
+
+  // Make the PDF link clickable
+  archive
+    .getRange(nextRow, 8)
+    .setFormula(
+      '=HYPERLINK("' +
+      pdfFile.getUrl() +
+      '","Open Full Quote")'
+    );
+
+  // Format dates
+  archive
+    .getRange(nextRow, 3)
+    .setNumberFormat('m/d/yyyy');
+
+  archive
+    .getRange(nextRow, 9)
+    .setNumberFormat('m/d/yyyy h:mm AM/PM');
+
+  // Sort customer first, then date
+  if (archive.getLastRow() > 2) {
+    archive
+      .getRange(
+        2,
+        1,
+        archive.getLastRow() - 1,
+        archive.getLastColumn()
+      )
+      .sort([
+        { column: 1, ascending: true },
+        { column: 3, ascending: false }
+      ]);
+  }
+  // Create editable Google Sheets copy on the first save only
+try {
+  createEditableQuoteCopy(
+    preparedBy,
+    customer,
+    finalQuoteNumber
+  );
+} catch (err) {
+  ui.alert(
+    'The PDF was saved, but the editable quote copy failed:\n\n' +
+    err.message
+  );
+  return;
+}
+try {
+  saveQuoteToRegister(
+    quoteSheet,
+    finalQuoteNumber,
+    quoteDate,
+    customer,
+    attention,
+    preparedBy,
+    quoteType,
+    total,
+    revision,
+    pdfFile.getUrl()
+  );
+} catch (err) {
+  ui.alert(
+    'Quote was saved, but Quote Register failed:\n\n' +
+    err.message
+  );
+}
+
+  ui.alert(
+    'Quote saved successfully.\n\n' +
+    'Quote #: ' +
+    finalQuoteNumber +
+    '\nCustomer: ' +
+    customer
+  );
+}
+
+
+/***************************************************************
+ * CUSTOMER DATABASE
+ ***************************************************************/
+function saveItemToDatabase(
+  item,
+  partNumber,
+  customerCost,
+  ourCost,
+  category
+) {
+  if (!item) return;
+
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName('Item Database');
+
+  if (!db) {
+    throw new Error('Item Database sheet was not found.');
+  }
+
+  const lastRow = db.getLastRow();
+  let existingRow = 0;
+
+  if (lastRow >= 4) {
+    const existingItems = db
+      .getRange(4, 1, lastRow - 3, 2)
+      .getDisplayValues();
+
+    for (let i = 0; i < existingItems.length; i++) {
+      const dbItem = String(existingItems[i][0]).trim();
+      const dbPart = String(existingItems[i][1]).trim();
+
+      const partMatches =
+        partNumber &&
+        dbPart.toLowerCase() ===
+          String(partNumber).trim().toLowerCase();
+
+      const itemMatches =
+        !partNumber &&
+        dbItem.toLowerCase() ===
+          String(item).trim().toLowerCase();
+
+      if (partMatches || itemMatches) {
+        existingRow = i + 4;
+        break;
+      }
+    }
+  }
+
+ const rowData = [[
+  item,
+  partNumber,
+  category,
+  customerCost,
+  ourCost
+]];
+
+  if (existingRow) {
+    db.getRange(existingRow, 1, 1, 5).setValues(rowData);
+  } else {
+    db.getRange(db.getLastRow() + 1, 1, 1, 5)
+      .setValues(rowData);
+  }
+}
+function saveQuoteItemsToDatabase(quoteSheet) {
+  const rowCount =
+    CONFIG.ITEM_END_ROW -
+    CONFIG.ITEM_START_ROW +
+    1;
+
+  const rows = quoteSheet
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      1,
+      rowCount,
+      8
+    )
+    .getValues();
+
+  rows.forEach(function(row, index) {
+    const item = String(row[1] || '').trim();
+    const partNumber = String(row[2] || '').trim();
+    const category = String(row[3] || '').trim();
+    const customerCost = row[4];
+    const ourCost = row[5];
+
+    if (!item) return;
+
+    if (!category) {
+      throw new Error(
+        'Select a Category for item "' +
+        item +
+        '" on row ' +
+        (CONFIG.ITEM_START_ROW + index) +
+        '.'
+      );
+    }
+
+    saveItemToDatabase(
+      item,
+      partNumber,
+      customerCost,
+      ourCost,
+      category
+    );
+  });
+
+  sortItemDatabaseByCategory();
+}
+
+
+function sortItemDatabaseByCategory() {
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName('Item Database');
+  const lists = masterSS.getSheetByName('Lists');
+
+  if (!db || !lists) return;
+
+  const lastDbRow = db.getLastRow();
+
+  if (lastDbRow < 5) return;
+
+  const lastListRow = lists.getLastRow();
+
+  const categories = lists
+    .getRange(2, 12, lastListRow - 1, 1)
+    .getDisplayValues()
+    .flat()
+    .map(function(value) {
+      return String(value).trim();
+    })
+    .filter(function(value) {
+      return value !== '';
+    });
+
+  const categoryOrder = {};
+
+  categories.forEach(function(category, index) {
+    categoryOrder[category.toLowerCase()] = index;
+  });
+
+  const range = db.getRange(
+    4,
+    1,
+    lastDbRow - 3,
+    5
+  );
+
+  const values = range.getValues();
+
+  values.sort(function(a, b) {
+    const categoryA =
+      String(a[4] || '').trim().toLowerCase();
+
+    const categoryB =
+      String(b[4] || '').trim().toLowerCase();
+
+    const orderA =
+      categoryOrder[categoryA] !== undefined
+        ? categoryOrder[categoryA]
+        : 9999;
+
+    const orderB =
+      categoryOrder[categoryB] !== undefined
+        ? categoryOrder[categoryB]
+        : 9999;
+
+    if (orderA !== orderB) {
+      return orderA - orderB;
+    }
+
+    return String(a[0] || '')
+      .localeCompare(String(b[0] || ''));
+  });
+
+  range.setValues(values);
+}
+
+/***************************************************************
+ * LOAD CUSTOMER INFO
+ ***************************************************************/
+function loadCustomerInformation() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const quoteSheet = ss.getSheetByName(CONFIG.QUOTE_SHEET);
+  const db = ss.getSheetByName(CONFIG.CUSTOMER_DB);
+
+  if (!quoteSheet || !db) return;
+
+  const customer = String(
+    quoteSheet.getRange(CONFIG.CUSTOMER_CELL).getDisplayValue()
+  ).trim();
+
+  if (!customer) {
+    quoteSheet.getRange(CONFIG.ATTENTION_CELL).clearContent();
+    quoteSheet.getRange(CONFIG.PHONE_CELL).clearContent();
+    quoteSheet.getRange(CONFIG.EMAIL_CELL).clearContent();
+    return;
+  }
+
+  const lastRow = db.getLastRow();
+
+  if (lastRow < 2) return;
+
+  const data = db
+    .getRange(2, 1, lastRow - 1, 4)
+    .getDisplayValues();
+
+  for (let i = 0; i < data.length; i++) {
+    const dbCustomer = String(data[i][0]).trim();
+
+    if (
+      dbCustomer.toLowerCase() === customer.toLowerCase()
+    ) {
+      quoteSheet
+        .getRange(CONFIG.ATTENTION_CELL)
+        .setValue(data[i][1]);
+
+      quoteSheet
+        .getRange(CONFIG.PHONE_CELL)
+        .setValue(data[i][2]);
+
+      quoteSheet
+        .getRange(CONFIG.EMAIL_CELL)
+        .setValue(data[i][3]);
+
+      return;
+    }
+  }
+}
+
+
+/***************************************************************
+ * FIND SALESPERSON'S QUOTES FOLDER
+ *
+ * Lists sheet:
+ * C = Prepared By
+ * G = Quotes Folder ID
+ ***************************************************************/
+function getSalespersonQuoteFolder(preparedBy) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lists = ss.getSheetByName(CONFIG.LISTS_SHEET);
+
+  if (!lists) return null;
+
+  const lastRow = lists.getLastRow();
+
+  if (lastRow < 2) return null;
+
+  const data = lists
+    .getRange(2, 3, lastRow - 1, 5)
+    .getDisplayValues();
+
+  for (let i = 0; i < data.length; i++) {
+    const salesperson = String(data[i][0]).trim();
+
+    // Column G relative to C:G = index 4
+    const quotesFolderId = String(data[i][4]).trim();
+
+    if (
+      salesperson.toLowerCase() ===
+      preparedBy.toLowerCase()
+    ) {
+      return quotesFolderId;
+    }
+  }
+
+  return null;
+}
+function createEditableQuoteCopy(preparedBy, customer, quoteNumber) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const editableFolderId =
+    getSalespersonEditableQuoteFolder(preparedBy);
+
+  if (!editableFolderId) {
+    throw new Error(
+      'No Editable Quotes Folder ID was found for ' + preparedBy + '.'
+    );
+  }
+
+  const editableFolder =
+    DriveApp.getFolderById(editableFolderId);
+
+  // If this file is already inside the Editable Quotes folder,
+  // do NOT create another editable copy.
+  const currentFile = DriveApp.getFileById(ss.getId());
+  const parents = currentFile.getParents();
+
+  while (parents.hasNext()) {
+    if (parents.next().getId() === editableFolderId) {
+      return null;
+    }
+  }
+
+  const safeCustomer = String(customer)
+    .replace(/[\\/:*?"<>|]/g, '')
+    .trim();
+
+  const editableName =
+    safeCustomer +
+    ' - Quote ' +
+    quoteNumber +
+    ' - EDITABLE';
+
+  // Copy the entire working quote workbook
+  const copiedFile =
+    currentFile.makeCopy(editableName, editableFolder);
+
+  const copiedSS =
+    SpreadsheetApp.openById(copiedFile.getId());
+
+  /*
+   * Freeze the Lists data inside the archived copy.
+   * This is important for salesperson copies that use IMPORTRANGE.
+   */
+  const copiedLists =
+    copiedSS.getSheetByName(CONFIG.LISTS_SHEET);
+
+  if (copiedLists) {
+    const lastRow = copiedLists.getLastRow();
+
+    if (lastRow > 0) {
+      const listRange =
+        copiedLists.getRange(1, 3, lastRow, 6);
+
+      const listValues =
+        listRange.getDisplayValues();
+
+      listRange.clearContent();
+      listRange.setValues(listValues);
+    }
+  }
+
+  /*
+   * Only Quote and Customer Quote remain visible.
+   * Everything else stays in the file so formulas/scripts continue working.
+   */
+  copiedSS.getSheets().forEach(function(sheet) {
+    const name = sheet.getName();
+
+    if (
+      name === CONFIG.QUOTE_SHEET ||
+      name === CONFIG.CUSTOMER_QUOTE_SHEET
+    ) {
+      sheet.showSheet();
+    } else {
+      sheet.hideSheet();
+    }
+  });
+
+  SpreadsheetApp.flush();
+
+  return copiedFile;
+}
+
+
+/***************************************************************
+ * CREATE CUSTOMER QUOTE PDF
+ ***************************************************************/
+function createCustomerQuotePDF(
+  customerQuoteSheet,
+  folderId,
+  customer,
+  quoteNumber
+) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const spreadsheetId = ss.getId();
+  const sheetId = customerQuoteSheet.getSheetId();
+
+  const safeCustomer = customer
+    .replace(/[\\\/:*?"<>|]/g, '')
+    .trim();
+
+  const fileName =
+    safeCustomer +
+    ' - Quote ' +
+    quoteNumber +
+    '.pdf';
+
+  const url =
+    'https://docs.google.com/spreadsheets/d/' +
+    spreadsheetId +
+    '/export?' +
+    'format=pdf' +
+    '&size=letter' +
+    '&portrait=true' +
+    '&fitw=true' +
+    '&sheetnames=false' +
+    '&printtitle=false' +
+    '&pagenumbers=false' +
+    '&gridlines=false' +
+    '&fzr=false' +
+    '&gid=' +
+    sheetId;
+
+  const token = ScriptApp.getOAuthToken();
+
+  const response = UrlFetchApp.fetch(url, {
+    headers: {
+      Authorization: 'Bearer ' + token
+    }
+  });
+
+  const blob = response
+    .getBlob()
+    .setName(fileName);
+
+  const folder = DriveApp.getFolderById(folderId);
+
+  return folder.createFile(blob);
+}
+
+
+/***************************************************************
+ * GET BASE QUOTE NUMBER
+ ***************************************************************/
+function getBaseQuoteNumber(quoteNumber) {
+  const value = String(quoteNumber).trim();
+  const parts = value.split('-');
+
+  // New format:
+  // 25-26-0001
+  // 25-26-0001-2
+  if (parts.length >= 3) {
+    return parts[0] + '-' + parts[1] + '-' + parts[2];
+  }
+
+  // Keeps compatibility with old quote numbers
+  return parts[0].trim();
+}
+
+
+
+/***************************************************************
+ * FIND NEXT REVISION
+ ***************************************************************/
+function getNextRevisionNumber(baseQuoteNumber) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let highestRevision = 0;
+
+  [CONFIG.SALES_ARCHIVE, CONFIG.SERVICE_ARCHIVE].forEach(
+    function(sheetName) {
+      const sheet = ss.getSheetByName(sheetName);
+
+      if (!sheet || sheet.getLastRow() < 2) return;
+
+      const values = sheet
+        .getRange(2, 2, sheet.getLastRow() - 1, 1)
+        .getDisplayValues();
+
+      values.forEach(function(row) {
+        const savedQuote = String(row[0]).trim();
+
+        if (!savedQuote) return;
+
+        const savedBase = getBaseQuoteNumber(savedQuote);
+
+        if (savedBase !== baseQuoteNumber) return;
+
+        let revision = 1;
+
+        const parts = savedQuote.split('-');
+
+if (parts.length >= 4) {
+  revision = parseInt(parts[3], 10);
+
+  if (isNaN(revision)) revision = 1;
+}
+
+        if (revision > highestRevision) {
+          highestRevision = revision;
+        }
+      });
+    }
+  );
+
+  if (highestRevision === 0) {
+    return 1;
+  }
+
+  return highestRevision + 1;
+}
+
+
+/***************************************************************
+ * CLEAR QUOTE FOR NEXT CUSTOMER
+ *
+ * Does NOT clear formulas.
+ ***************************************************************/
+function clearQuote() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CONFIG.QUOTE_SHEET);
+
+  const ui = SpreadsheetApp.getUi();
+
+  const response = ui.alert(
+    'Clear Quote',
+    'Clear the current quote and start a new one?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) return;
+
+  // Top section
+  sheet.getRange(CONFIG.QUOTE_NUMBER_CELL).clearContent();
+  sheet.getRange(CONFIG.DATE_CELL).clearContent();
+
+  sheet.getRange('E6').clearContent();
+  sheet.getRange('G4').setValue('Draft');
+sheet.getRange('G5').clearContent();
+sheet.getRange('G6').clearContent();
+
+  sheet.getRange(CONFIG.CUSTOMER_CELL).clearContent();
+  sheet.getRange(CONFIG.ATTENTION_CELL).clearContent();
+  sheet.getRange(CONFIG.PHONE_CELL).clearContent();
+  sheet.getRange(CONFIG.EMAIL_CELL).clearContent();
+
+  const rowCount =
+    CONFIG.ITEM_END_ROW -
+    CONFIG.ITEM_START_ROW +
+    1;
+
+  // A:F = Qty, Item, Part Number, Category, Customer Cost, Our Cost
+  sheet
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      1,
+      rowCount,
+      6
+    )
+    .clearContent();
+
+  // H = Notes
+  sheet
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      8,
+      rowCount,
+      1
+    )
+    .clearContent();
+
+  // G stays untouched because it contains Line Cost formulas
+
+  SpreadsheetApp.flush();
+
+  ui.alert('Quote cleared.');
+}
+function saveCustomerToDatabase(customer, attention, phone, email) {
+  if (!customer) return;
+
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName('Customer Database');
+
+  if (!db) {
+    throw new Error('Customer Database sheet was not found.');
+  }
+
+  const cleanCustomer = String(customer).trim();
+  const cleanAttention = String(attention || '').trim();
+  const cleanPhone = String(phone || '').trim();
+  const cleanEmail = String(email || '').trim();
+
+  const lastRow = db.getLastRow();
+  let existingRow = 0;
+
+  if (lastRow >= 2) {
+    const data = db
+      .getRange(2, 1, lastRow - 1, 4)
+      .getDisplayValues();
+
+    for (let i = 0; i < data.length; i++) {
+      const dbCustomer =
+        String(data[i][0] || '').trim().toLowerCase();
+
+      const dbAttention =
+        String(data[i][1] || '').trim().toLowerCase();
+
+      const sameCustomer =
+        dbCustomer === cleanCustomer.toLowerCase();
+
+      const sameContact =
+        dbAttention === cleanAttention.toLowerCase();
+
+      if (sameCustomer && sameContact) {
+        existingRow = i + 2;
+        break;
+      }
+    }
+  }
+
+  const rowData = [[
+    cleanCustomer,
+    cleanAttention,
+    cleanPhone,
+    cleanEmail,
+    new Date()
+  ]];
+
+  if (existingRow) {
+    // Same company + same contact:
+    // update phone/email/date instead of duplicating.
+    db
+      .getRange(existingRow, 1, 1, 5)
+      .setValues(rowData);
+  } else {
+    // New company OR different contact at same company:
+    // create a new customer/contact row.
+    db
+      .getRange(db.getLastRow() + 1, 1, 1, 5)
+      .setValues(rowData);
+  }
+}
+function saveQuoteItemsToDatabase(quoteSheet) {
+  const rowCount =
+    CONFIG.ITEM_END_ROW -
+    CONFIG.ITEM_START_ROW +
+    1;
+
+  const rows = quoteSheet
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      1,
+      rowCount,
+      8
+    )
+    .getValues();
+
+  rows.forEach(function(row, index) {
+    const item = String(row[1] || '').trim();
+    const partNumber = String(row[2] || '').trim();
+    const category = String(row[3] || '').trim();
+    const customerCost = row[4];
+    const ourCost = row[5];
+
+    if (!item) return;
+
+    if (!category) {
+      throw new Error(
+        'Select a Category for item "' +
+        item +
+        '" on row ' +
+        (CONFIG.ITEM_START_ROW + index) +
+        '.'
+      );
+    }
+
+    saveItemToDatabase(
+      item,
+      partNumber,
+      customerCost,
+      ourCost,
+      category
+    );
+  });
+
+  sortItemDatabaseByCategory();
+}
+
+
+function sortItemDatabaseByCategory() {
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName('Item Database');
+  const lists = masterSS.getSheetByName('Lists');
+
+  if (!db || !lists) return;
+
+  const lastDbRow = db.getLastRow();
+
+  if (lastDbRow < 5) return;
+
+  const lastListRow = lists.getLastRow();
+
+  const categories = lists
+    .getRange(2, 12, lastListRow - 1, 1)
+    .getDisplayValues()
+    .flat()
+    .map(function(value) {
+      return String(value).trim();
+    })
+    .filter(function(value) {
+      return value !== '';
+    });
+
+  const categoryOrder = {};
+
+  categories.forEach(function(category, index) {
+    categoryOrder[category.toLowerCase()] = index;
+  });
+
+  const range = db.getRange(
+    4,
+    1,
+    lastDbRow - 3,
+    5
+  );
+
+  const values = range.getValues();
+
+  values.sort(function(a, b) {
+    const categoryA =
+      String(a[4] || '').trim().toLowerCase();
+
+    const categoryB =
+      String(b[4] || '').trim().toLowerCase();
+
+    const orderA =
+      categoryOrder[categoryA] !== undefined
+        ? categoryOrder[categoryA]
+        : 9999;
+
+    const orderB =
+      categoryOrder[categoryB] !== undefined
+        ? categoryOrder[categoryB]
+        : 9999;
+
+    if (orderA !== orderB) {
+      return orderA - orderB;
+    }
+
+    return String(a[0] || '')
+      .localeCompare(String(b[0] || ''));
+  });
+
+  range.setValues(values);
+}
+function getSalespersonEditableQuoteFolder(preparedBy) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lists = ss.getSheetByName(CONFIG.LISTS_SHEET);
+
+  if (!lists) return null;
+
+  const lastRow = lists.getLastRow();
+
+  if (lastRow < 2) return null;
+
+  const data = lists
+    .getRange(2, 3, lastRow - 1, 6)
+    .getDisplayValues();
+
+  for (let i = 0; i < data.length; i++) {
+    const salesperson = String(data[i][0]).trim();
+    const editableFolderId = String(data[i][5]).trim();
+
+    if (
+      salesperson.toLowerCase() ===
+      preparedBy.toLowerCase()
+    ) {
+      return editableFolderId;
+    }
+  }
+
+  return null;
+}
+function onEdit(e) {
+  if (!e) return;
+
+  const sheet = e.range.getSheet();
+
+  if (sheet.getName() !== 'Archive Search') return;
+
+  // J2 checkbox
+  if (e.range.getA1Notation() !== 'J2') return;
+
+  if (e.value !== 'TRUE') return;
+
+  try {
+    createRevisionFromArchiveSearch();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert(
+      'Could not create revision:\n\n' + err.message
+    );
+  } finally {
+    sheet.getRange('J2').setValue(false);
+  }
+}
+function createRevisionFromArchiveSearch() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const searchSheet = ss.getSheetByName('Archive Search');
+  const quoteSheet = ss.getSheetByName(CONFIG.QUOTE_SHEET);
+
+  if (!searchSheet || !quoteSheet) {
+    throw new Error('Archive Search or Quote sheet was not found.');
+  }
+
+  const selectedQuoteNumber = String(
+    searchSheet.getRange('H2').getDisplayValue()
+  ).trim();
+
+  if (!selectedQuoteNumber) {
+    throw new Error(
+      'Select a quote number in Revision Quote # first.'
+    );
+  }
+
+  const register = ss.getSheetByName('Quote Register');
+
+  let customer = '';
+  let preparedBy = '';
+  let editableUrl = '';
+
+  if (register && register.getLastRow() >= 2) {
+    const rows = register
+      .getRange(
+        2,
+        1,
+        register.getLastRow() - 1,
+        16
+      )
+      .getDisplayValues();
+
+    for (let i = 0; i < rows.length; i++) {
+      if (
+        String(rows[i][3]).trim() ===
+        selectedQuoteNumber
+      ) {
+        customer = String(rows[i][1]).trim();
+        preparedBy = String(rows[i][5]).trim();
+        editableUrl = String(rows[i][13]).trim();
+        break;
+      }
+    }
+  }
+
+  // Fallback to local quote archives
+  if (!customer) {
+    const archiveNames = [
+      CONFIG.SALES_ARCHIVE,
+      CONFIG.SERVICE_ARCHIVE
+    ];
+
+    for (let a = 0; a < archiveNames.length; a++) {
+      const archive = ss.getSheetByName(archiveNames[a]);
+
+      if (!archive || archive.getLastRow() < 2) continue;
+
+      const rows = archive
+        .getRange(
+          2,
+          1,
+          archive.getLastRow() - 1,
+          9
+        )
+        .getDisplayValues();
+
+      for (let i = 0; i < rows.length; i++) {
+        if (
+          String(rows[i][1]).trim() ===
+          selectedQuoteNumber
+        ) {
+          customer = String(rows[i][0]).trim();
+          preparedBy = String(rows[i][3]).trim();
+          break;
+        }
+      }
+
+      if (customer) break;
+    }
+  }
+
+  if (!customer) {
+    throw new Error(
+      'Quote ' +
+      selectedQuoteNumber +
+      ' was not found.'
+    );
+  }
+
+  let sourceSpreadsheet = null;
+
+  // Use stored editable link when available
+  if (editableUrl) {
+    const match = editableUrl.match(
+      /\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/
+    );
+
+    if (match) {
+      sourceSpreadsheet =
+        SpreadsheetApp.openById(match[1]);
+    }
+  }
+
+  // Fallback: find editable copy in salesperson folder
+  if (!sourceSpreadsheet) {
+    const editableFolderId =
+      getSalespersonEditableQuoteFolder(preparedBy);
+
+    if (!editableFolderId) {
+      throw new Error(
+        'Editable Quotes folder was not found for ' +
+        preparedBy +
+        '.'
+      );
+    }
+
+    const folder =
+      DriveApp.getFolderById(editableFolderId);
+
+    const expectedName =
+      customer +
+      ' - Quote ' +
+      selectedQuoteNumber +
+      ' - EDITABLE';
+
+    const files =
+      folder.getFilesByName(expectedName);
+
+    if (!files.hasNext()) {
+      throw new Error(
+        'Editable quote file was not found for ' +
+        selectedQuoteNumber +
+        '.'
+      );
+    }
+
+    sourceSpreadsheet =
+      SpreadsheetApp.openById(
+        files.next().getId()
+      );
+  }
+
+  const sourceQuote =
+    sourceSpreadsheet.getSheetByName(
+      CONFIG.QUOTE_SHEET
+    );
+
+  if (!sourceQuote) {
+    throw new Error(
+      'Quote tab was not found in the editable copy.'
+    );
+  }
+
+  // Copy customer information
+  quoteSheet
+    .getRange(CONFIG.CUSTOMER_CELL)
+    .setValue(
+      sourceQuote
+        .getRange(CONFIG.CUSTOMER_CELL)
+        .getValue()
+    );
+
+  quoteSheet
+    .getRange(CONFIG.ATTENTION_CELL)
+    .setValue(
+      sourceQuote
+        .getRange(CONFIG.ATTENTION_CELL)
+        .getValue()
+    );
+
+  quoteSheet
+    .getRange(CONFIG.PHONE_CELL)
+    .setValue(
+      sourceQuote
+        .getRange(CONFIG.PHONE_CELL)
+        .getValue()
+    );
+
+  quoteSheet
+    .getRange(CONFIG.EMAIL_CELL)
+    .setValue(
+      sourceQuote
+        .getRange(CONFIG.EMAIL_CELL)
+        .getValue()
+    );
+
+  quoteSheet
+    .getRange(CONFIG.QUOTE_TYPE_CELL)
+    .setValue(
+      sourceQuote
+        .getRange(CONFIG.QUOTE_TYPE_CELL)
+        .getValue()
+    );
+
+  // Copy PO number
+  quoteSheet
+    .getRange('E6')
+    .setValue(
+      sourceQuote
+        .getRange('E6')
+        .getValue()
+    );
+
+  // Copy quote items A:H
+  const rowCount =
+    CONFIG.ITEM_END_ROW -
+    CONFIG.ITEM_START_ROW +
+    1;
+
+  const sourceItems = sourceQuote
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      1,
+      rowCount,
+      8
+    )
+    .getValues();
+
+  quoteSheet
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      1,
+      rowCount,
+      8
+    )
+    .setValues(sourceItems);
+
+  // Set base quote number so saveQuote creates next revision
+  const baseQuoteNumber =
+    getBaseQuoteNumber(selectedQuoteNumber);
+
+  quoteSheet
+    .getRange(CONFIG.QUOTE_NUMBER_CELL)
+    .setValue(baseQuoteNumber);
+
+  // New revision gets today's date
+  quoteSheet
+    .getRange(CONFIG.DATE_CELL)
+    .setValue(new Date());
+
+  SpreadsheetApp.flush();
+
+  ss.setActiveSheet(quoteSheet);
+
+  SpreadsheetApp.getUi().alert(
+    'Quote loaded for revision.\n\n' +
+    'Original Quote: ' +
+    selectedQuoteNumber +
+    '\nNext save will create the next revision.'
+  );
+}
+function saveQuoteToRegister(
+  quoteSheet,
+  finalQuoteNumber,
+  quoteDate,
+  customer,
+  attention,
+  preparedBy,
+  quoteType,
+  total,
+  revision,
+  pdfUrl
+) {
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const register = masterSS.getSheetByName('Quote Register');
+
+  if (!register) {
+    throw new Error('Quote Register was not found in Dylan Master.');
+  }
+
+  const status =
+    String(quoteSheet.getRange('G4').getDisplayValue()).trim() ||
+    'Draft';
+
+  const followUpDate =
+    quoteSheet.getRange('G5').getValue();
+
+  const notes =
+    String(quoteSheet.getRange('G6').getDisplayValue()).trim();
+
+  const rowCount =
+    CONFIG.ITEM_END_ROW -
+    CONFIG.ITEM_START_ROW +
+    1;
+
+  const itemRows = quoteSheet
+    .getRange(
+      CONFIG.ITEM_START_ROW,
+      2,
+      rowCount,
+      2
+    )
+    .getDisplayValues();
+
+  const itemSummary = itemRows
+    .filter(function(row) {
+      return row[0] || row[1];
+    })
+    .map(function(row) {
+      const item = String(row[0] || '').trim();
+      const part = String(row[1] || '').trim();
+
+      if (item && part) {
+        return item + ' (' + part + ')';
+      }
+
+      return item || part;
+    })
+    .join(', ');
+
+  const quoteId = Utilities.getUuid();
+
+  const nextRow = register.getLastRow() + 1;
+
+  register.getRange(nextRow, 1, 1, 16).setValues([[
+    quoteId,
+    customer,
+    attention,
+    finalQuoteNumber,
+    quoteDate,
+    preparedBy,
+    quoteType,
+    total,
+    revision,
+    status,
+    followUpDate || '',
+    new Date(),
+    pdfUrl || '',
+    '',
+    notes,
+    itemSummary
+  ]]);
+
+  register
+    .getRange(nextRow, 5)
+    .setNumberFormat('m/d/yyyy');
+
+  register
+    .getRange(nextRow, 8)
+    .setNumberFormat('$#,##0.00');
+
+  register
+    .getRange(nextRow, 11)
+    .setNumberFormat('m/d/yyyy');
+
+  register
+    .getRange(nextRow, 12)
+    .setNumberFormat('m/d/yyyy h:mm AM/PM');
+}
+function autoFillCustomer(quoteSheet) {
+  const customer = String(
+    quoteSheet
+      .getRange(CONFIG.CUSTOMER_CELL)
+      .getDisplayValue()
+  ).trim();
+
+  const attentionCell =
+    quoteSheet.getRange(CONFIG.ATTENTION_CELL);
+
+  const phoneCell =
+    quoteSheet.getRange(CONFIG.PHONE_CELL);
+
+  const emailCell =
+    quoteSheet.getRange(CONFIG.EMAIL_CELL);
+
+  attentionCell.clearDataValidations();
+
+  if (!customer) {
+    attentionCell.clearContent();
+    phoneCell.clearContent();
+    emailCell.clearContent();
+    return;
+  }
+
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName(
+    'Customer Database'
+  );
+
+  if (!db || db.getLastRow() < 2) return;
+
+  const rows = db
+    .getRange(
+      2,
+      1,
+      db.getLastRow() - 1,
+      4
+    )
+    .getDisplayValues();
+
+  const matches = rows.filter(function(row) {
+    return (
+      String(row[0]).trim().toLowerCase() ===
+      customer.toLowerCase()
+    );
+  });
+
+  if (matches.length === 0) {
+    attentionCell.clearContent();
+    phoneCell.clearContent();
+    emailCell.clearContent();
+    return;
+  }
+
+  const contacts = matches
+    .map(function(row) {
+      return String(row[1] || '').trim();
+    })
+    .filter(function(value) {
+      return value !== '';
+    });
+
+  const uniqueContacts =
+    [...new Set(contacts)];
+
+  if (uniqueContacts.length > 0) {
+    const rule =
+      SpreadsheetApp
+        .newDataValidation()
+        .requireValueInList(
+          uniqueContacts,
+          true
+        )
+        .setAllowInvalid(true)
+        .build();
+
+    attentionCell.setDataValidation(rule);
+  }
+
+  const firstMatch = matches[0];
+
+  attentionCell.setValue(
+    firstMatch[1] || ''
+  );
+
+  phoneCell.setValue(
+    firstMatch[2] || ''
+  );
+
+  emailCell.setValue(
+    firstMatch[3] || ''
+  );
+}
+function autoFillCustomerContact(quoteSheet) {
+  const customer = String(
+    quoteSheet
+      .getRange(CONFIG.CUSTOMER_CELL)
+      .getDisplayValue()
+  ).trim();
+
+  const attention = String(
+    quoteSheet
+      .getRange(CONFIG.ATTENTION_CELL)
+      .getDisplayValue()
+  ).trim();
+
+  if (!customer || !attention) return;
+
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName(
+    'Customer Database'
+  );
+
+  if (!db || db.getLastRow() < 2) return;
+
+  const rows = db
+    .getRange(
+      2,
+      1,
+      db.getLastRow() - 1,
+      4
+    )
+    .getDisplayValues();
+
+  for (let i = 0; i < rows.length; i++) {
+    const dbCustomer =
+      String(rows[i][0] || '')
+        .trim()
+        .toLowerCase();
+
+    const dbAttention =
+      String(rows[i][1] || '')
+        .trim()
+        .toLowerCase();
+
+    if (
+      dbCustomer === customer.toLowerCase() &&
+      dbAttention === attention.toLowerCase()
+    ) {
+      quoteSheet
+        .getRange(CONFIG.PHONE_CELL)
+        .setValue(rows[i][2] || '');
+
+      quoteSheet
+        .getRange(CONFIG.EMAIL_CELL)
+        .setValue(rows[i][3] || '');
+
+      return;
+    }
+  }
+}
+function autoFillItemRow(
+  quoteSheet,
+  rowNumber,
+  editedColumn
+) {
+  const item = String(
+    quoteSheet
+      .getRange(rowNumber, 2)
+      .getDisplayValue()
+  ).trim();
+
+  const partNumber = String(
+    quoteSheet
+      .getRange(rowNumber, 3)
+      .getDisplayValue()
+  ).trim();
+
+  if (!item && !partNumber) return;
+
+  const masterSS = SpreadsheetApp.openById(
+    CONFIG.MASTER_SPREADSHEET_ID
+  );
+
+  const db = masterSS.getSheetByName(
+    'Item Database'
+  );
+
+  if (!db || db.getLastRow() < 4) return;
+
+  const rows = db
+    .getRange(
+      4,
+      1,
+      db.getLastRow() - 3,
+      5
+    )
+    .getValues();
+
+  let match = null;
+
+  for (let i = 0; i < rows.length; i++) {
+    const dbItem =
+      String(rows[i][0] || '')
+        .trim()
+        .toLowerCase();
+
+    const dbPart =
+      String(rows[i][1] || '')
+        .trim()
+        .toLowerCase();
+
+    if (
+      editedColumn === 3 &&
+      partNumber &&
+      dbPart === partNumber.toLowerCase()
+    ) {
+      match = rows[i];
+      break;
+    }
+
+    if (
+      editedColumn === 2 &&
+      item &&
+      dbItem === item.toLowerCase()
+    ) {
+      match = rows[i];
+      break;
+    }
+  }
+
+  if (!match) return;
+
+  // A Qty stays untouched
+
+  quoteSheet
+    .getRange(rowNumber, 2)
+    .setValue(match[0]);
+
+  quoteSheet
+    .getRange(rowNumber, 3)
+    .setValue(match[1]);
+
+  quoteSheet
+    .getRange(rowNumber, 4)
+    .setValue(match[2]);
+
+  quoteSheet
+    .getRange(rowNumber, 5)
+    .setValue(match[3]);
+
+  quoteSheet
+    .getRange(rowNumber, 6)
+    .setValue(match[4]);
+}
